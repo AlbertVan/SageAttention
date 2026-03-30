@@ -4,6 +4,13 @@ from typing import Optional, Tuple
 from diffusers.models import WanTransformer3DModel
 from diffusers.models.transformers.transformer_wan import WanAttention, _get_qkv_projections, _get_added_kv_projections
 
+from einops import rearrange
+import torch.distributed as dist
+try:
+    from xfuser.core.distributed import get_ulysses_parallel_world_size
+    from xfuser.model_executor.layers.usp import _ft_c_input_all_to_all, _ft_c_output_all_to_all
+except:
+    pass
 
 class SageWanAttnProcessor:
     def __init__(self, attn_func):
@@ -12,6 +19,11 @@ class SageWanAttnProcessor:
             raise ImportError(
                 "WanAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
             )
+        self.use_sp = False
+
+        if dist.is_initialized() and get_ulysses_parallel_world_size() > 1:
+            self.use_sp = True
+        self.pad_len = 0
 
     def __call__(
         self,
@@ -59,7 +71,6 @@ class SageWanAttnProcessor:
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-
         # I2V task
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -68,6 +79,8 @@ class SageWanAttnProcessor:
 
             key_img = key_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
             value_img = value_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            #key_img = key_img.unflatten(2, (attn.heads, -1))
+            #value_img = value_img.unflatten(2, (attn.heads, -1))
 
             hidden_states_img = self.attn_func(
                 query,
@@ -77,18 +90,74 @@ class SageWanAttnProcessor:
                 dropout_p=0.0,
                 is_causal=False,
             )
+            '''
+            hidden_states_img = self.attn_func(
+                query,
+                key_img,
+                value_img,
+                causal=False,
+            )
+            '''
             hidden_states_img = hidden_states_img.transpose(1, 2).flatten(2, 3)
+            #hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
-        hidden_states = self.attn_func(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+        if attn.cross_attention_dim_head is not None: # case for cross attention
+            hidden_states = self.attn_func(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            '''
+            hidden_states = self.attn_func(
+                query,
+                key,
+                value,
+                causal=False,
+            )
+            '''
+        else:
+            if self.use_sp:
+                #query = rearrange(query, "b s h d" " -> b h s d").contiguous()
+                #key = rearrange(key, "b s h d" " -> b h s d").contiguous()
+                #value = rearrange(value, "b s h d" " -> b h s d").contiguous()
+                query = _ft_c_input_all_to_all(query)
+                key = _ft_c_input_all_to_all(key)
+                value = _ft_c_input_all_to_all(value)
+                #query = rearrange(query, "b h s d" " -> b s h d").contiguous()
+                #key = rearrange(key, "b h s d" " -> b s h d").contiguous()
+                #value = rearrange(value, "b h s d" " -> b s h d").contiguous()
+            if self.pad_len > 0:
+                query = query[:, :, : -self.pad_len].contiguous()
+                key = key[:, :, : -self.pad_len].contiguous()
+                value = value[:, :, : -self.pad_len].contiguous()
+            #print(f"query shape = {query.shape}, pad_len = {self.pad_len}")
+            hidden_states = self.attn_func(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            '''
+            hidden_states = self.attn_func(
+                query,
+                key,
+                value,
+                causal=False,
+            )
+            '''
+            if self.use_sp:
+                #hidden_states = rearrange(hidden_states.contiguous(), "b s h d -> b h s d").contiguous()
+                hidden_states = _ft_c_output_all_to_all(hidden_states)
+                #hidden_states = rearrange(hidden_states, "b h s d -> b s h d").contiguous()
+
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        #hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
         if hidden_states_img is not None:
